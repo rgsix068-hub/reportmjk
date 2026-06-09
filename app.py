@@ -1,10 +1,10 @@
 """
 Daily Report Generator — PT Nale System Integrator
-Versi dengan:
+Versi final:
 - Upload foto tanpa batasan
-- DOCX: otomatis menambah halaman & tabel foto sesuai jumlah foto (per 8 foto)
+- DOCX: otomatis menambah halaman & tabel foto (8 foto per halaman, clone dari template)
 - PDF: 4 foto per halaman (grid 2x2)
-- Persist hanya PIC & Team Support
+- Persist hanya PIC Project dan Team Support
 """
 
 import streamlit as st
@@ -20,11 +20,9 @@ from copy import deepcopy
 import io
 import json
 import re
-
-# Untuk PDF
-from fpdf import FPDF
 import tempfile
 import os
+from fpdf import FPDF
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -128,9 +126,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-
 # ═══════════════════════════════════════════════════════════════
-# PERSISTENCE
+# PERSISTENCE (hanya PIC dan Team Support)
 # ═══════════════════════════════════════════════════════════════
 def load_persist():
     try:
@@ -228,7 +225,7 @@ def fix_image_orientation(img_bytes: bytes) -> bytes:
     return out.getvalue()
 
 # ═══════════════════════════════════════════════════════════════
-# DOCX MANIPULATION HELPERS (tambah fungsi untuk clone tabel)
+# DOCX MANIPULATION HELPERS
 # ═══════════════════════════════════════════════════════════════
 def set_cell_text(cell, text, *, bold=None, font_size_pt=None, align=None, preserve_format=True):
     existing_font = None
@@ -370,38 +367,6 @@ def fill_data_table(table, rows_data, col_extractors, center_cols=None):
             align = WD_ALIGN_PARAGRAPH.CENTER if col_idx in center_cols else WD_ALIGN_PARAGRAPH.LEFT
             set_cell_text(row.cells[col_idx], value, align=align)
 
-def create_photo_table(doc, template_table, rows=4, cols=2):
-    """
-    Clone template table (yang berisi 4x2 grid) dan tambahkan ke doc.
-    template_table adalah tabel yang sudah ada (misal doc.tables[6]).
-    """
-    # Clone seluruh elemen tabel
-    new_tbl = deepcopy(template_table._tbl)
-    # Tambahkan ke body dokumen sebelum section break
-    body = doc.element.body
-    # Cari posisi terakhir setelah semua paragraf/tabel
-    body.append(new_tbl)
-    # Return tabel yang baru dibuat
-    return doc.tables[-1]  # karena baru ditambahkan di akhir
-
-def add_photo_page(doc, template_table):
-    """
-    Menambah halaman baru dengan heading "LAMPIRAN FOTO KEGIATAN" dan tabel foto (4x2).
-    Return tabel baru.
-    """
-    # Tambah page break
-    p = doc.add_paragraph()
-    force_page_break_before(p)
-    # Tambah heading
-    heading = doc.add_paragraph()
-    run = heading.add_run("LAMPIRAN FOTO KEGIATAN")
-    run.bold = True
-    run.underline = True
-    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    # Tambah tabel baru hasil clone dari template_table
-    new_table = create_photo_table(doc, template_table)
-    return new_table
-
 # ═══════════════════════════════════════════════════════════════
 # CORE BUILD REPORT (DOCX) - tanpa batasan foto
 # ═══════════════════════════════════════════════════════════════
@@ -483,56 +448,34 @@ def build_report_docx(data, photos):
     
     # ========== PHOTO SECTION - TANPA BATASAN ==========
     if photos:
-        # Template tabel foto asli (Table 6) yang memiliki 4 baris x 2 kolom = 8 slot
+        # Simpan template tabel foto asli (Table 6) untuk di-clone
         template_table = doc.tables[6]
-        # Hapus Table 6 dan Table 7 dari template karena kita akan membuat ulang semuanya
-        # Kita akan hapus kedua tabel tersebut dan membuat halaman foto baru secara dinamis.
-        # Cara: cari semua tabel setelah Table 5, lalu hapus (karena kita akan buat ulang)
-        # Lebih mudah: simpan referensi template_table untuk cloning, lalu hapus semua tabel mulai dari indeks 6.
+        # Hapus semua tabel foto yang sudah ada (Table 6 dan seterusnya)
         tables_to_remove = []
         for i in range(6, len(doc.tables)):
             tables_to_remove.append(doc.tables[i])
         for tbl in tables_to_remove:
             tbl._element.getparent().remove(tbl._element)
         
-        # Sekarang buat halaman foto pertama
-        # Pastikan ada page break sebelum lampiran foto
-        p_break = doc.add_paragraph()
-        force_page_break_before(p_break)
-        heading1 = doc.add_paragraph()
-        run1 = heading1.add_run("LAMPIRAN FOTO KEGIATAN")
-        run1.bold = True
-        run1.underline = True
-        heading1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        # Fungsi untuk membuat tabel foto baru dari template
+        def create_photo_table():
+            new_tbl = deepcopy(template_table._tbl)
+            doc.element.body.append(new_tbl)
+            return doc.tables[-1]
         
-        # Buat tabel pertama dengan clone template_table
-        new_table = create_photo_table(doc, template_table)
-        
-        # Isi foto per 8
-        photos_per_page = 8
-        total_photos = len(photos)
-        photo_idx = 0
-        
-        # Fungsi untuk mengisi tabel tertentu dengan foto
-        def fill_one_table(table, start_idx):
-            row_idx = 0
-            for row in table.rows:
-                for cell in row.cells:
-                    if start_idx + row_idx*2 + (row_idx==0?0:0) < len(photos):
-                        p = photos[start_idx + row_idx*2 + (cell._element.getparent().index(cell._element) % 2)]
-                        # Agak tricky, lebih mudah iterasi cell berurutan
-                        pass
-            # Cara simple: urutkan cell dari kiri ke kanan, atas ke bawah
+        # Fungsi untuk mengisi tabel dengan foto
+        def fill_photo_table(table, start_idx):
             cells = []
             for row in table.rows:
                 for cell in row.cells:
                     cells.append(cell)
             for i, cell in enumerate(cells):
-                if start_idx + i < len(photos):
-                    p = photos[start_idx + i]
+                idx = start_idx + i
+                if idx < len(photos):
+                    p = photos[idx]
                     add_image_to_cell(cell, p["bytes"], p["caption"])
                 else:
-                    # kosongkan cell
+                    # Kosongkan cell
                     for para in cell.paragraphs:
                         for r in list(para.runs):
                             r._element.getparent().remove(r._element)
@@ -540,28 +483,20 @@ def build_report_docx(data, photos):
                     for ex in extras:
                         ex._element.getparent().remove(ex._element)
         
-        # Isi tabel pertama
-        cells_first = []
-        for row in new_table.rows:
-            for cell in row.cells:
-                cells_first.append(cell)
-        for i, cell in enumerate(cells_first):
-            if i < len(photos):
-                p = photos[i]
-                add_image_to_cell(cell, p["bytes"], p["caption"])
-            else:
-                for para in cell.paragraphs:
-                    for r in list(para.runs):
-                        r._element.getparent().remove(r._element)
-                extras = list(cell.paragraphs)[1:]
-                for ex in extras:
-                    ex._element.getparent().remove(ex._element)
+        # Halaman pertama
+        p_break = doc.add_paragraph()
+        force_page_break_before(p_break)
+        heading = doc.add_paragraph()
+        run = heading.add_run("LAMPIRAN FOTO KEGIATAN")
+        run.bold = True
+        run.underline = True
+        heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
-        # Jika foto lebih dari 8, tambah halaman baru setiap 8 foto
-        remaining = photos[8:]
-        page_num = 1
+        current_table = create_photo_table()
+        fill_photo_table(current_table, 0)
+        
+        # Halaman berikutnya jika foto > 8
         for start in range(8, len(photos), 8):
-            # Tambah halaman baru dengan heading dan tabel
             p_break_new = doc.add_paragraph()
             force_page_break_before(p_break_new)
             heading_new = doc.add_paragraph()
@@ -569,26 +504,10 @@ def build_report_docx(data, photos):
             run_new.bold = True
             run_new.underline = True
             heading_new.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            new_table_page = create_photo_table(doc, template_table)
-            cells_new = []
-            for row in new_table_page.rows:
-                for cell in row.cells:
-                    cells_new.append(cell)
-            for i, cell in enumerate(cells_new):
-                idx = start + i
-                if idx < len(photos):
-                    p = photos[idx]
-                    add_image_to_cell(cell, p["bytes"], p["caption"])
-                else:
-                    for para in cell.paragraphs:
-                        for r in list(para.runs):
-                            r._element.getparent().remove(r._element)
-                    extras = list(cell.paragraphs)[1:]
-                    for ex in extras:
-                        ex._element.getparent().remove(ex._element)
+            new_table = create_photo_table()
+            fill_photo_table(new_table, start)
     else:
-        # Tidak ada foto, hapus bagian foto di template asli
-        # Hapus semua paragraf "LAMPIRAN FOTO KEGIATAN" dan tabel 6,7
+        # Tidak ada foto, hapus bagian foto di template
         body = doc.element.body
         to_remove = []
         in_photo = False
@@ -697,40 +616,20 @@ def build_report_pdf(data, photos):
     else:
         pdf.cell(0, 6, "Tidak ada material.", 0, 1)
     
-    # ========== LAMPIRAN FOTO - 4 FOTO PER HALAMAN (GRID 2x2) ==========
+    # Lampiran Foto (4 foto per halaman)
     if photos:
         pdf.add_page()
         pdf.set_font('Arial', 'B', 11)
         pdf.cell(0, 8, 'LAMPIRAN FOTO KEGIATAN', 0, 1, 'C')
         pdf.ln(5)
         
-        # Atur grid 2 kolom, 2 baris per halaman
         img_width = 80  # mm
-        img_height = 60  # mm (proporsional, nanti disesuaikan)
+        img_height = 60  # mm
         x_left = 20
-        x_right = 110  # 20 + 80 + 10 = 110
-        y_start = pdf.get_y()
-        y_step = 70  # tinggi per baris foto + caption
+        x_right = 110  # 20 + 80 + 10
+        y_step = 70
         
-        for idx, p in enumerate(photos):
-            # Tentukan posisi baris dan kolom
-            row = idx // 2
-            col = idx % 2
-            if row >= 2:  # lebih dari 2 baris, pindah halaman
-                pdf.add_page()
-                pdf.set_font('Arial', 'B', 11)
-                pdf.cell(0, 8, 'LAMPIRAN FOTO KEGIATAN (lanjutan)', 0, 1, 'C')
-                pdf.ln(5)
-                y_start = pdf.get_y()
-                row = 0
-                # reset idx untuk perhitungan? kita lanjutkan dengan idx yang sama tapi row baru
-                # Karena kita pindah halaman, kita set ulang row=0, col=idx%2
-                # Kita perlu simpan offset halaman, lebih mudah pakai while
-                pass
-            # Karena logika di atas tidak sempurna, lebih baik pakai pendekatan per halaman:
-            # Kita buat per 4 foto.
-        
-        # Pendekatan lebih sederhana: loop per 4 foto
+        # Proses per 4 foto
         for page_start in range(0, len(photos), 4):
             if page_start > 0:
                 pdf.add_page()
@@ -752,7 +651,6 @@ def build_report_pdf(data, photos):
                         tmp.write(p['bytes'])
                         tmp_path = tmp.name
                     pdf.image(tmp_path, x=x, y=y, w=img_width)
-                    # Caption di bawah foto
                     pdf.set_xy(x, y + img_height)
                     pdf.set_font('Arial', 'I', 8)
                     pdf.cell(img_width, 5, f"Foto {idx+1}: {p['caption']}", 0, 1, 'C')
@@ -767,9 +665,8 @@ def build_report_pdf(data, photos):
     return output
 
 # ═══════════════════════════════════════════════════════════════
-# UI (sama seperti sebelumnya, hanya modifikasi caption di tab foto)
+# UI
 # ═══════════════════════════════════════════════════════════════
-
 st.markdown("""
 <div class="brand-header">
   <div>
@@ -792,7 +689,7 @@ full_data = st.session_state.full_data
 tab_info, tab_photos = st.tabs(["📋 Info & Kegiatan", "📸 Foto"])
 
 # ═══════════════════════════════════════════════════════════════
-# TAB INFO & KEGIATAN (sama seperti sebelumnya, disingkat)
+# TAB INFO & KEGIATAN
 # ═══════════════════════════════════════════════════════════════
 with tab_info:
     # --- 1. Informasi Umum ---
