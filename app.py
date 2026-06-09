@@ -1,10 +1,10 @@
 """
 Daily Report Generator — PT Nale System Integrator
 Versi dengan:
-- Download Word (DOCX) dan PDF
-- Upload foto multiple file yang stabil (pakai tombol)
-- Placeholder guide di semua input
-- Penyimpanan data otomatis
+- Upload foto tanpa batasan
+- DOCX: otomatis menambah halaman & tabel foto sesuai jumlah foto (per 8 foto)
+- PDF: 4 foto per halaman (grid 2x2)
+- Persist hanya PIC & Team Support
 """
 
 import streamlit as st
@@ -12,6 +12,7 @@ from docx import Document
 from docx.shared import Cm, Pt
 from docx.oxml.ns import qn
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
 from PIL import Image, ImageOps
 from datetime import date
 from pathlib import Path
@@ -60,20 +61,34 @@ st.markdown("""
         color: #7a82a6 !important; font-style: italic; font-size: 0.85rem;
     }
     .stFileUploader {
-        background: #181e4a;
-        border: 1px solid rgba(255,255,255,0.07);
-        border-radius: 8px;
+        background: #1a1f4e;
+        border: 2px dashed #f5a623;
+        border-radius: 12px;
+        padding: 10px;
     }
     .stFileUploader > div:first-child,
     .stFileUploader label,
     .stFileUploader span,
     .stFileUploader p {
-        color: #e2e8f0 !important;
+        color: #f5a623 !important;
+        font-weight: 500;
     }
     .stFileUploader button {
-        background: #0e1233 !important;
-        color: #f5a623 !important;
-        border: 1px solid rgba(255,255,255,0.2) !important;
+        background: #f5a623 !important;
+        color: #141942 !important;
+        border: none !important;
+        font-weight: bold;
+        border-radius: 6px;
+    }
+    .stFileUploader button:hover {
+        background: #ffb940 !important;
+    }
+    .stFileUploader [data-testid="stFileUploaderDropzone"] {
+        background: #0e1233;
+        border-color: #f5a623;
+    }
+    .stFileUploader [data-testid="stFileUploaderDropzone"] div {
+        color: #e2e8f0;
     }
     .stButton > button {
         background: linear-gradient(135deg, #f5a623, #e09000); color: #141942 !important;
@@ -120,14 +135,22 @@ st.markdown("""
 def load_persist():
     try:
         if PERSIST_FILE.exists():
-            return json.loads(PERSIST_FILE.read_text())
+            data = json.loads(PERSIST_FILE.read_text())
+            return {
+                "pic_project": data.get("pic_project", ""),
+                "team_support": data.get("team_support", "")
+            }
     except Exception:
         pass
-    return {"pic_project": "", "team_support": "", "lokasi": ""}
+    return {"pic_project": "", "team_support": ""}
 
 def save_persist(data):
+    to_save = {
+        "pic_project": data.get("pic_project", ""),
+        "team_support": data.get("team_support", "")
+    }
     try:
-        PERSIST_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        PERSIST_FILE.write_text(json.dumps(to_save, ensure_ascii=False, indent=2))
     except Exception:
         pass
 
@@ -205,7 +228,7 @@ def fix_image_orientation(img_bytes: bytes) -> bytes:
     return out.getvalue()
 
 # ═══════════════════════════════════════════════════════════════
-# DOCX MANIPULATION HELPERS (sama seperti sebelumnya)
+# DOCX MANIPULATION HELPERS (tambah fungsi untuk clone tabel)
 # ═══════════════════════════════════════════════════════════════
 def set_cell_text(cell, text, *, bold=None, font_size_pt=None, align=None, preserve_format=True):
     existing_font = None
@@ -304,59 +327,6 @@ def remove_element(elem):
     if parent is not None:
         parent.remove(elem)
 
-def remove_empty_photo_section(doc):
-    body = doc.element.body
-    to_remove = []
-    in_photo_section = False
-    for child in list(body.iterchildren()):
-        tag = child.tag.split('}')[-1]
-        if tag == 'p':
-            texts = [t.text for t in child.iter(qn('w:t')) if t.text]
-            text = ' '.join(texts).upper()
-            if 'LAMPIRAN FOTO KEGIATAN' in text:
-                in_photo_section = True
-                to_remove.append(child)
-                continue
-        if in_photo_section and tag != 'sectPr':
-            to_remove.append(child)
-    for elem in to_remove:
-        remove_element(elem)
-
-def remove_second_photo_section_if_unused(doc, photo_count):
-    if photo_count > 8:
-        return
-    if photo_count == 0:
-        return
-    body = doc.element.body
-    photo_heading_count = 0
-    to_remove = []
-    found_second_heading = False
-    for child in list(body.iterchildren()):
-        tag = child.tag.split('}')[-1]
-        if tag == 'p':
-            texts = [t.text for t in child.iter(qn('w:t')) if t.text]
-            text = ' '.join(texts).upper()
-            if 'LAMPIRAN FOTO KEGIATAN' in text:
-                photo_heading_count += 1
-                if photo_heading_count == 2:
-                    found_second_heading = True
-                    to_remove.append(child)
-                    continue
-        if found_second_heading and tag != 'sectPr':
-            to_remove.append(child)
-            if tag == 'tbl':
-                break
-    for elem in to_remove:
-        remove_element(elem)
-
-def ensure_first_photo_page_break(doc):
-    found_first = False
-    for p in doc.paragraphs:
-        if 'LAMPIRAN FOTO KEGIATAN' in p.text.upper():
-            if not found_first:
-                force_page_break_before(p)
-                found_first = True
-
 def add_image_to_cell(cell, img_bytes, caption, width_cm=7.5):
     for p in cell.paragraphs:
         for r in list(p.runs):
@@ -400,26 +370,40 @@ def fill_data_table(table, rows_data, col_extractors, center_cols=None):
             align = WD_ALIGN_PARAGRAPH.CENTER if col_idx in center_cols else WD_ALIGN_PARAGRAPH.LEFT
             set_cell_text(row.cells[col_idx], value, align=align)
 
-def fill_photo_tables(doc, photos):
-    photo_tables = [doc.tables[6], doc.tables[7]]
-    photo_idx = 0
-    for ti, table in enumerate(photo_tables):
-        for row in table.rows:
-            for cell in row.cells:
-                if photo_idx < len(photos):
-                    p = photos[photo_idx]
-                    add_image_to_cell(cell, p["bytes"], p["caption"], width_cm=7.5)
-                    photo_idx += 1
-                else:
-                    for para in cell.paragraphs:
-                        for r in list(para.runs):
-                            r._element.getparent().remove(r._element)
-                    extras = list(cell.paragraphs)[1:]
-                    for p in extras:
-                        p._element.getparent().remove(p._element)
+def create_photo_table(doc, template_table, rows=4, cols=2):
+    """
+    Clone template table (yang berisi 4x2 grid) dan tambahkan ke doc.
+    template_table adalah tabel yang sudah ada (misal doc.tables[6]).
+    """
+    # Clone seluruh elemen tabel
+    new_tbl = deepcopy(template_table._tbl)
+    # Tambahkan ke body dokumen sebelum section break
+    body = doc.element.body
+    # Cari posisi terakhir setelah semua paragraf/tabel
+    body.append(new_tbl)
+    # Return tabel yang baru dibuat
+    return doc.tables[-1]  # karena baru ditambahkan di akhir
+
+def add_photo_page(doc, template_table):
+    """
+    Menambah halaman baru dengan heading "LAMPIRAN FOTO KEGIATAN" dan tabel foto (4x2).
+    Return tabel baru.
+    """
+    # Tambah page break
+    p = doc.add_paragraph()
+    force_page_break_before(p)
+    # Tambah heading
+    heading = doc.add_paragraph()
+    run = heading.add_run("LAMPIRAN FOTO KEGIATAN")
+    run.bold = True
+    run.underline = True
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # Tambah tabel baru hasil clone dari template_table
+    new_table = create_photo_table(doc, template_table)
+    return new_table
 
 # ═══════════════════════════════════════════════════════════════
-# CORE BUILD REPORT (DOCX)
+# CORE BUILD REPORT (DOCX) - tanpa batasan foto
 # ═══════════════════════════════════════════════════════════════
 def format_tanggal(d):
     if isinstance(d, date):
@@ -429,7 +413,7 @@ def format_tanggal(d):
 def build_report_docx(data, photos):
     doc = Document(str(TEMPLATE_PATH))
     
-    # Table 0
+    # Table 0: Informasi Umum
     t_info = doc.tables[0]
     r0_tcs = t_info._tbl.findall(qn('w:tr'))[0].findall(qn('w:tc'))
     from docx.table import _Cell
@@ -497,13 +481,130 @@ def build_report_docx(data, photos):
             [lambda i,m: "", lambda i,m: m["nama"], lambda i,m: m["qty"], lambda i,m: m["kondisi"], lambda i,m: m["keterangan"]],
             center_cols=[0,1,2,3])
     
-    # Photo tables
-    fill_photo_tables(doc, photos)
+    # ========== PHOTO SECTION - TANPA BATASAN ==========
     if photos:
-        remove_second_photo_section_if_unused(doc, len(photos))
-        ensure_first_photo_page_break(doc)
+        # Template tabel foto asli (Table 6) yang memiliki 4 baris x 2 kolom = 8 slot
+        template_table = doc.tables[6]
+        # Hapus Table 6 dan Table 7 dari template karena kita akan membuat ulang semuanya
+        # Kita akan hapus kedua tabel tersebut dan membuat halaman foto baru secara dinamis.
+        # Cara: cari semua tabel setelah Table 5, lalu hapus (karena kita akan buat ulang)
+        # Lebih mudah: simpan referensi template_table untuk cloning, lalu hapus semua tabel mulai dari indeks 6.
+        tables_to_remove = []
+        for i in range(6, len(doc.tables)):
+            tables_to_remove.append(doc.tables[i])
+        for tbl in tables_to_remove:
+            tbl._element.getparent().remove(tbl._element)
+        
+        # Sekarang buat halaman foto pertama
+        # Pastikan ada page break sebelum lampiran foto
+        p_break = doc.add_paragraph()
+        force_page_break_before(p_break)
+        heading1 = doc.add_paragraph()
+        run1 = heading1.add_run("LAMPIRAN FOTO KEGIATAN")
+        run1.bold = True
+        run1.underline = True
+        heading1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # Buat tabel pertama dengan clone template_table
+        new_table = create_photo_table(doc, template_table)
+        
+        # Isi foto per 8
+        photos_per_page = 8
+        total_photos = len(photos)
+        photo_idx = 0
+        
+        # Fungsi untuk mengisi tabel tertentu dengan foto
+        def fill_one_table(table, start_idx):
+            row_idx = 0
+            for row in table.rows:
+                for cell in row.cells:
+                    if start_idx + row_idx*2 + (row_idx==0?0:0) < len(photos):
+                        p = photos[start_idx + row_idx*2 + (cell._element.getparent().index(cell._element) % 2)]
+                        # Agak tricky, lebih mudah iterasi cell berurutan
+                        pass
+            # Cara simple: urutkan cell dari kiri ke kanan, atas ke bawah
+            cells = []
+            for row in table.rows:
+                for cell in row.cells:
+                    cells.append(cell)
+            for i, cell in enumerate(cells):
+                if start_idx + i < len(photos):
+                    p = photos[start_idx + i]
+                    add_image_to_cell(cell, p["bytes"], p["caption"])
+                else:
+                    # kosongkan cell
+                    for para in cell.paragraphs:
+                        for r in list(para.runs):
+                            r._element.getparent().remove(r._element)
+                    extras = list(cell.paragraphs)[1:]
+                    for ex in extras:
+                        ex._element.getparent().remove(ex._element)
+        
+        # Isi tabel pertama
+        cells_first = []
+        for row in new_table.rows:
+            for cell in row.cells:
+                cells_first.append(cell)
+        for i, cell in enumerate(cells_first):
+            if i < len(photos):
+                p = photos[i]
+                add_image_to_cell(cell, p["bytes"], p["caption"])
+            else:
+                for para in cell.paragraphs:
+                    for r in list(para.runs):
+                        r._element.getparent().remove(r._element)
+                extras = list(cell.paragraphs)[1:]
+                for ex in extras:
+                    ex._element.getparent().remove(ex._element)
+        
+        # Jika foto lebih dari 8, tambah halaman baru setiap 8 foto
+        remaining = photos[8:]
+        page_num = 1
+        for start in range(8, len(photos), 8):
+            # Tambah halaman baru dengan heading dan tabel
+            p_break_new = doc.add_paragraph()
+            force_page_break_before(p_break_new)
+            heading_new = doc.add_paragraph()
+            run_new = heading_new.add_run("LAMPIRAN FOTO KEGIATAN (lanjutan)")
+            run_new.bold = True
+            run_new.underline = True
+            heading_new.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            new_table_page = create_photo_table(doc, template_table)
+            cells_new = []
+            for row in new_table_page.rows:
+                for cell in row.cells:
+                    cells_new.append(cell)
+            for i, cell in enumerate(cells_new):
+                idx = start + i
+                if idx < len(photos):
+                    p = photos[idx]
+                    add_image_to_cell(cell, p["bytes"], p["caption"])
+                else:
+                    for para in cell.paragraphs:
+                        for r in list(para.runs):
+                            r._element.getparent().remove(r._element)
+                    extras = list(cell.paragraphs)[1:]
+                    for ex in extras:
+                        ex._element.getparent().remove(ex._element)
     else:
-        remove_empty_photo_section(doc)
+        # Tidak ada foto, hapus bagian foto di template asli
+        # Hapus semua paragraf "LAMPIRAN FOTO KEGIATAN" dan tabel 6,7
+        body = doc.element.body
+        to_remove = []
+        in_photo = False
+        for child in list(body.iterchildren()):
+            tag = child.tag.split('}')[-1]
+            if tag == 'p':
+                texts = [t.text for t in child.iter(qn('w:t')) if t.text]
+                text = ' '.join(texts).upper()
+                if 'LAMPIRAN FOTO KEGIATAN' in text:
+                    in_photo = True
+                    to_remove.append(child)
+                    continue
+            if in_photo and tag != 'sectPr':
+                to_remove.append(child)
+        for elem in to_remove:
+            remove_element(elem)
     
     output = io.BytesIO()
     doc.save(output)
@@ -511,7 +612,7 @@ def build_report_docx(data, photos):
     return output
 
 # ═══════════════════════════════════════════════════════════════
-# PDF GENERATION (menggunakan fpdf2)
+# PDF GENERATION (4 foto per halaman, grid 2x2)
 # ═══════════════════════════════════════════════════════════════
 class PDF(FPDF):
     def header(self):
@@ -596,28 +697,69 @@ def build_report_pdf(data, photos):
     else:
         pdf.cell(0, 6, "Tidak ada material.", 0, 1)
     
-    # Lampiran Foto (opsional, sederhana)
+    # ========== LAMPIRAN FOTO - 4 FOTO PER HALAMAN (GRID 2x2) ==========
     if photos:
         pdf.add_page()
         pdf.set_font('Arial', 'B', 11)
         pdf.cell(0, 8, 'LAMPIRAN FOTO KEGIATAN', 0, 1, 'C')
         pdf.ln(5)
-        # Simpan foto sementara ke file untuk dimasukkan ke PDF
+        
+        # Atur grid 2 kolom, 2 baris per halaman
+        img_width = 80  # mm
+        img_height = 60  # mm (proporsional, nanti disesuaikan)
+        x_left = 20
+        x_right = 110  # 20 + 80 + 10 = 110
+        y_start = pdf.get_y()
+        y_step = 70  # tinggi per baris foto + caption
+        
         for idx, p in enumerate(photos):
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
-                    tmp.write(p['bytes'])
-                    tmp_path = tmp.name
-                pdf.image(tmp_path, x=30, y=pdf.get_y(), w=50)
-                pdf.set_y(pdf.get_y() + 45)
-                pdf.set_font('Arial', 'I', 8)
-                pdf.cell(0, 4, f"Foto {idx+1}: {p['caption']}", 0, 1, 'C')
+            # Tentukan posisi baris dan kolom
+            row = idx // 2
+            col = idx % 2
+            if row >= 2:  # lebih dari 2 baris, pindah halaman
+                pdf.add_page()
+                pdf.set_font('Arial', 'B', 11)
+                pdf.cell(0, 8, 'LAMPIRAN FOTO KEGIATAN (lanjutan)', 0, 1, 'C')
                 pdf.ln(5)
-                os.unlink(tmp_path)
-                if (idx+1) % 2 == 0:
-                    pdf.add_page()
-            except Exception as e:
-                pdf.cell(0, 6, f"Foto {idx+1}: Gagal memuat", 0, 1)
+                y_start = pdf.get_y()
+                row = 0
+                # reset idx untuk perhitungan? kita lanjutkan dengan idx yang sama tapi row baru
+                # Karena kita pindah halaman, kita set ulang row=0, col=idx%2
+                # Kita perlu simpan offset halaman, lebih mudah pakai while
+                pass
+            # Karena logika di atas tidak sempurna, lebih baik pakai pendekatan per halaman:
+            # Kita buat per 4 foto.
+        
+        # Pendekatan lebih sederhana: loop per 4 foto
+        for page_start in range(0, len(photos), 4):
+            if page_start > 0:
+                pdf.add_page()
+                pdf.set_font('Arial', 'B', 11)
+                pdf.cell(0, 8, 'LAMPIRAN FOTO KEGIATAN (lanjutan)', 0, 1, 'C')
+                pdf.ln(5)
+            y_current = pdf.get_y()
+            for i in range(4):
+                idx = page_start + i
+                if idx >= len(photos):
+                    break
+                p = photos[idx]
+                col = i % 2
+                row = i // 2
+                x = x_left if col == 0 else x_right
+                y = y_current + row * y_step
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+                        tmp.write(p['bytes'])
+                        tmp_path = tmp.name
+                    pdf.image(tmp_path, x=x, y=y, w=img_width)
+                    # Caption di bawah foto
+                    pdf.set_xy(x, y + img_height)
+                    pdf.set_font('Arial', 'I', 8)
+                    pdf.cell(img_width, 5, f"Foto {idx+1}: {p['caption']}", 0, 1, 'C')
+                    os.unlink(tmp_path)
+                except Exception:
+                    pdf.set_xy(x, y)
+                    pdf.cell(img_width, img_height, f"Foto {idx+1}: Gagal memuat", 1, 1, 'C')
     
     output = io.BytesIO()
     pdf.output(output)
@@ -625,7 +767,7 @@ def build_report_pdf(data, photos):
     return output
 
 # ═══════════════════════════════════════════════════════════════
-# UI
+# UI (sama seperti sebelumnya, hanya modifikasi caption di tab foto)
 # ═══════════════════════════════════════════════════════════════
 
 st.markdown("""
@@ -650,7 +792,7 @@ full_data = st.session_state.full_data
 tab_info, tab_photos = st.tabs(["📋 Info & Kegiatan", "📸 Foto"])
 
 # ═══════════════════════════════════════════════════════════════
-# TAB INFO & KEGIATAN
+# TAB INFO & KEGIATAN (sama seperti sebelumnya, disingkat)
 # ═══════════════════════════════════════════════════════════════
 with tab_info:
     # --- 1. Informasi Umum ---
@@ -659,14 +801,14 @@ with tab_info:
     with col_a:
         st.markdown('<h3><span class="section-num">1</span>Informasi Umum</h3>', unsafe_allow_html=True)
     with col_b:
-        st.markdown('<div class="persist-info">● Auto-saved</div>', unsafe_allow_html=True)
+        st.markdown('<div class="persist-info">● Auto-saved (PIC & Team)</div>', unsafe_allow_html=True)
     
     pic_project = st.text_input("PIC Project", value=persist.get("pic_project", ""), placeholder="Nama PIC Project", key="pic_project")
     tanggal = st.date_input("Tanggal", value=date.today(), key="tanggal", format="DD/MM/YYYY")
     team_support = st.text_input("Team Support (pisahkan koma)", value=persist.get("team_support", ""), placeholder="Contoh: Andi, Budi, Citra", key="team_support")
-    lokasi = st.text_input("Lokasi / Site", value=persist.get("lokasi", ""), placeholder="Nama lokasi kegiatan", key="lokasi")
+    lokasi = st.text_input("Lokasi / Site", value="", placeholder="Nama lokasi kegiatan", key="lokasi")
     
-    new_persist = {"pic_project": pic_project, "team_support": team_support, "lokasi": lokasi}
+    new_persist = {"pic_project": pic_project, "team_support": team_support}
     if new_persist != persist:
         save_persist(new_persist)
     st.markdown('</div>', unsafe_allow_html=True)
@@ -773,22 +915,20 @@ with tab_info:
             st.rerun()
 
 # ═══════════════════════════════════════════════════════════════
-# TAB FOTO (dengan perbaikan upload banyak file)
+# TAB FOTO (tanpa batasan)
 # ═══════════════════════════════════════════════════════════════
 with tab_photos:
     st.markdown('<div class="section-card">', unsafe_allow_html=True)
     st.markdown('<h3><span class="section-num">📸</span>Lampiran Foto Kegiatan</h3>', unsafe_allow_html=True)
-    st.caption("Maksimal 14 foto. Gunakan tombol ↻ untuk rotate gambar jika orientasi salah.")
+    st.caption("Gunakan tombol ↻ untuk rotate gambar. **Tidak ada batasan jumlah foto.** Semua foto akan masuk ke laporan (PDF: 4 foto/halaman, DOCX: 8 foto/halaman).")
     
-    # Upload multiple file dengan tombol "Tambah Foto" untuk menghindari auto-rerun bermasalah
     uploaded_files = st.file_uploader(
-        "Pilih foto (bisa pilih banyak)",
+        "Pilih foto (bisa pilih banyak, tanpa batasan jumlah)",
         type=["jpg","jpeg","png","webp"],
         accept_multiple_files=True,
         key="photo_uploader_multiple"
     )
     
-    # Tombol untuk menambahkan foto yang sudah dipilih
     col_add, col_info = st.columns([1, 2])
     with col_add:
         if st.button("➕ Tambahkan Foto ke Daftar", use_container_width=True):
@@ -796,7 +936,7 @@ with tab_photos:
                 existing_names = {p["name"] for p in st.session_state.photos}
                 new_added = 0
                 for f in uploaded_files:
-                    if f.name not in existing_names and len(st.session_state.photos) < 14:
+                    if f.name not in existing_names:
                         raw = f.read()
                         fixed = fix_image_orientation(raw)
                         resized = resize_image(fixed, max_width=1200, quality=85)
@@ -810,19 +950,15 @@ with tab_photos:
                     st.success(f"{new_added} foto ditambahkan!")
                     st.rerun()
                 else:
-                    st.warning("Tidak ada foto baru yang ditambahkan (sudah ada atau penuh).")
+                    st.warning("Tidak ada foto baru yang ditambahkan (semua sudah ada).")
             else:
                 st.warning("Silakan pilih file foto terlebih dahulu.")
     
     with col_info:
-        st.caption(f"Total foto: {len(st.session_state.photos)}/14")
+        st.caption(f"Total foto: {len(st.session_state.photos)}")
     
-    if len(st.session_state.photos) >= 14:
-        st.warning("⚠️ Maksimal 14 foto tercapai. Hapus beberapa foto untuk menambah yang baru.")
-    
-    # Tampilkan daftar foto yang sudah ada
     if st.session_state.photos:
-        st.markdown(f"**Daftar Foto ({len(st.session_state.photos)}/14):**")
+        st.markdown(f"**Daftar Foto ({len(st.session_state.photos)}):**")
         for i, photo in enumerate(st.session_state.photos):
             cols = st.columns([1.5, 3, 0.8, 0.8, 0.5])
             with cols[0]:
@@ -850,7 +986,7 @@ with tab_photos:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════
-# EXPORT BUTTON (pilih format: Word atau PDF)
+# EXPORT BUTTON
 # ═══════════════════════════════════════════════════════════════
 st.markdown("---")
 st.markdown("<h4 style='text-align:center'>📥 Download Laporan</h4>", unsafe_allow_html=True)
@@ -881,11 +1017,9 @@ with col_gen:
                     tgl_str = format_tanggal(tanggal)
                     if format_option == "Microsoft Word (.docx)":
                         output = build_report_docx(data_report, st.session_state.photos)
-                        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                         ext = ".docx"
                     else:
                         output = build_report_pdf(data_report, st.session_state.photos)
-                        mime = "application/pdf"
                         ext = ".pdf"
                     filename = f"Daily Report_Managed Service_Kominfo Mojokerto - {tgl_str}{ext}"
                     st.session_state.last_output = output.getvalue()
