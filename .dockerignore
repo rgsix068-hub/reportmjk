@@ -1,0 +1,21 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.env
+.user_data.json
+.full_report_data.json
+node_modules
+daily-report-web/
+Foto */
+*.tmp
+.gitignore
+packages.txt
+README.md
+temp_func.txt
+temp_modify.py
+akun bkia.txt
+Backup Router Distri BKIA (Image) (1).pdf
+
+template mojokerto.pdf
+packages.txt
