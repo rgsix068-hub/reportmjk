@@ -18,12 +18,17 @@ import re
 import os
 import tempfile
 from fpdf import FPDF
+import fitz  # PyMuPDF for PDF template reading/manipulation
+import fitz  # PyMuPDF untuk membaca/mengedit PDF template
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 APP_DIR = Path(__file__).parent
 TEMPLATE_PATH = APP_DIR / "template.docx"
+TEMPLATE_PDF_PATH = APP_DIR / "template mojokerto.pdf"
+if not TEMPLATE_PDF_PATH.exists():
+    TEMPLATE_PDF_PATH = APP_DIR / "template.pdf"
 PERSIST_FILE = APP_DIR / ".user_data.json"
 FULL_DATA_FILE = APP_DIR / ".full_report_data.json"
 
@@ -517,201 +522,408 @@ def build_report(data, photos):
     return output
 
 # ═══════════════════════════════════════════════════════════════
-# PDF GENERATION (menggunakan fpdf2 — murni Python, cross-platform)
+# PDF GENERATION (Hybrid: win32com → fallback fpdf2++)
 # ═══════════════════════════════════════════════════════════════
 
-class ReportPDF(FPDF):
-    """Kelas PDF khusus untuk laporan Daily Report dengan layout profesional."""
+def _try_win32com_pdf(data, photos):
+    """Coba konversi DOCX → PDF via Word (Windows only)."""
+    try:
+        import pythoncom
+        from win32com.client import Dispatch
+    except (ImportError, AttributeError):
+        return None  # win32com tidak tersedia (Linux/Mac)
+    try:
+        docx_bytes = build_report(data, photos).getvalue()
+        tmp_dir = tempfile.mkdtemp()
+        docx_path = os.path.join(tmp_dir, "report_temp.docx")
+        pdf_path = os.path.join(tmp_dir, "report_temp.pdf")
+        with open(docx_path, "wb") as f:
+            f.write(docx_bytes)
+        pythoncom.CoInitialize()
+        try:
+            word = Dispatch("Word.Application")
+            word.Visible = False
+            word.DisplayAlerts = False
+            doc = word.Documents.Open(os.path.abspath(docx_path))
+            doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17)
+            doc.Close()
+            word.Quit()
+        finally:
+            pythoncom.CoUninitialize()
+        with open(pdf_path, "rb") as f:
+            result = f.read()
+        for p in [docx_path, pdf_path]:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except Exception:
+            pass
+        return io.BytesIO(result)
+    except Exception as e:
+        # Error teknis — biarkan fpdf2 sebagai fallback
+        return None
 
-    def header(self):
-        self.set_font('Helvetica', 'B', 11)
-        self.cell(0, 8, 'DAILY REPORT - NALE SYSTEM INTEGRATOR', new_x="LMARGIN", new_y="NEXT", align='C')
-        self.set_font('Helvetica', '', 9)
-        self.cell(0, 5, 'Managed Service Dinas Kominfo Kab. Mojokerto', new_x="LMARGIN", new_y="NEXT", align='C')
-        self.line(10, self.get_y()+1, 200, self.get_y()+1)
-        self.ln(5)
 
-    def footer(self):
-        self.set_y(-15)
-        self.set_font('Helvetica', 'I', 8)
-        self.cell(0, 10, f'Halaman {self.page_no()}', align='C')
 
-    def section_title(self, title):
-        self.set_font('Helvetica', 'B', 10)
-        self.set_fill_color(245, 166, 35)
-        self.cell(0, 7, f'  {title}', new_x="LMARGIN", new_y="NEXT", align='L', fill=True)
-        self.ln(3)
+def _try_pymupdf_template_pdf(data, photos):
+    try:
+        if not TEMPLATE_PDF_PATH.exists():
+            return None
+        doc = fitz.open(str(TEMPLATE_PDF_PATH))
+        page = doc[0]
+        page_rect = page.rect
+        redact_areas_page1 = [
+            (105, 163, 320, 180),
+            (380, 163, 560, 180),
+            (100, 183, 315, 213),
+            (380, 183, 560, 203),
+            (48, 288, 553, 375),
+            (48, 394, 553, 500),
+            (48, 505, 553, 610),
+            (48, 615, 553, 680),
+            (48, 698, 553, 760),
+        ]
+        for area in redact_areas_page1:
+            r = fitz.Rect(area[0], area[1], area[2], area[3])
+            page.add_redact_annot(r, fill=None)
+        page.apply_redactions()
+        # Try system Arial first, fallback to Base14 Helvetica (cross-platform)
+        # Font setup with cross-platform fallback
+        # Priority: Arial (Windows) -> Liberation Sans (Linux fonts-liberation) -> Helvetica (Base14)
+        font_candidates = [
+            ("Arial", "Arial-BoldMT"),              # Windows native Arial
+            ("LiberationSans", "LiberationSans-Bold"),  # Linux fonts-liberation (metric Arial)
+            ("Helvetica", "Helvetica-Bold"),         # Base14 fallback - always works
+        ]
+        font_regular = font_candidates[-1][0]
+        font_bold = font_candidates[-1][1]
+        for reg, bold in font_candidates:
+            try:
+                fitz.Font(reg)
+                fitz.Font(bold)
+                font_regular = reg
+                font_bold = bold
+                break
+            except Exception:
+                continue
 
-    def info_row(self, label, value):
-        self.set_font('Helvetica', 'B', 9)
-        self.cell(35, 6, label, new_x="END")
-        self.set_font('Helvetica', '', 9)
-        self.cell(0, 6, f': {value}', new_x="LMARGIN", new_y="NEXT")
+        page.insert_text(fitz.Point(108, 174), (data["pic_project"] or "-"), fontsize=9.5, fontname=font_regular, color=(0, 0, 0))
+        page.insert_text(fitz.Point(383, 174), format_tanggal(data["tanggal"]), fontsize=9.5, fontname=font_regular, color=(0, 0, 0))
+        team_list = [t.strip() for t in re.split(r"[,;\n]", data["team_support"]) if t.strip()]
+        if team_list:
+            mid = (len(team_list) + 1) // 2
+            for li, name in enumerate(team_list[:mid]):
+                page.insert_text(fitz.Point(108, 193 + li * 14), f"{li+1}. {name}", fontsize=9, fontname=font_regular, color=(0, 0, 0))
+            for li, name in enumerate(team_list[mid:]):
+                page.insert_text(fitz.Point(200, 193 + li * 14), f"{mid+li+1}. {name}", fontsize=9, fontname=font_regular, color=(0, 0, 0))
+        else:
+            page.insert_text(fitz.Point(108, 193), "-", fontsize=9, fontname=font_regular, color=(0, 0, 0))
+        page.insert_text(fitz.Point(383, 193), (data["lokasi"] or "-"), fontsize=9.5, fontname=font_regular, color=(0, 0, 0))
+        y_base = 289
+        for i, a in enumerate(data.get("activities", [])):
+            y = y_base + i * 18
+            if y + 18 > 375:
+                break
+            page.insert_text(fitz.Point(52, y + 5), str(i + 1), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(92, y + 5), str(a.get("waktu", "")), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(200, y + 5), str(a.get("uraian", "")), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(382, y + 5), str(a.get("keterangan", "")), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(502, y + 5), str(a.get("status", "")), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+        y_base = 395
+        for i, inc in enumerate(data.get("incidents", [])):
+            y = y_base + i * 18
+            if y + 18 > 500:
+                break
+            page.insert_text(fitz.Point(52, y + 5), str(i + 1), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(114, y + 5), str(inc.get("masalah", ""))[:60], fontsize=8, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(310, y + 5), str(inc.get("tindakan", ""))[:50], fontsize=8, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(475, y + 5), str(inc.get("hasil", ""))[:40], fontsize=8, fontname=font_regular, color=(0, 0, 0))
+        y_base = 506
+        for i, fu in enumerate(data.get("followups", [])):
+            y = y_base + i * 18
+            if y + 18 > 610:
+                break
+            page.insert_text(fitz.Point(52, y + 5), str(i + 1), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(114, y + 5), str(fu.get("deskripsi", ""))[:60], fontsize=8, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(310, y + 5), str(fu.get("alasan", ""))[:50], fontsize=8, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(475, y + 5), str(fu.get("target", ""))[:40], fontsize=8, fontname=font_regular, color=(0, 0, 0))
+        catatan = data.get("catatan", "")
+        if catatan:
+            page.insert_text(fitz.Point(52, 625), catatan[:200], fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+        y_base = 699
+        for i, m in enumerate(data.get("materials", [])):
+            y = y_base + i * 18
+            if y + 18 > 760:
+                break
+            page.insert_text(fitz.Point(52, y + 5), str(i + 1), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(144, y + 5), str(m.get("nama", ""))[:50], fontsize=8, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(328, y + 5), str(m.get("qty", "")), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(389, y + 5), str(m.get("kondisi", "")), fontsize=8.5, fontname=font_regular, color=(0, 0, 0))
+            page.insert_text(fitz.Point(476, y + 5), str(m.get("keterangan", ""))[:40], fontsize=8, fontname=font_regular, color=(0, 0, 0))
+        while doc.page_count > 1:
+            doc.delete_page(doc.page_count - 1)
+        if photos:
+            photos_per_page = 4
+            img_w = 240
+            img_h = 175
+            margin_left = 50
+            margin_top = 110
+            spacing_x = 20
+            spacing_y = 30
+            photo_idx = 0
+            while photo_idx < len(photos):
+                new_page = doc.new_page(width=page_rect.width, height=page_rect.height)
+                new_page.insert_text(fitz.Point(margin_left, 70), "LAMPIRAN FOTO KEGIATAN", fontsize=14, fontname=font_bold, color=(0, 0, 0))
+                new_page.draw_line(fitz.Point(margin_left, 75), fitz.Point(page_rect.width - margin_left, 75), color=(0.2, 0.2, 0.2), width=0.5)
+                for grid_i in range(photos_per_page):
+                    if photo_idx >= len(photos):
+                        break
+                    p = photos[photo_idx]
+                    col = grid_i % 2
+                    row = grid_i // 2
+                    x = margin_left + col * (img_w + spacing_x)
+                    y = margin_top + row * (img_h + spacing_y + 25)
+                    try:
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                        tmp.write(p["bytes"])
+                        tmp_path = tmp.name
+                        tmp.close()
+                        new_page.insert_image(fitz.Rect(x, y, x + img_w, y + img_h), filename=tmp_path)
+                        os.unlink(tmp_path)
+                        caption = p["caption"][:60] if p["caption"] else "Foto Kegiatan"
+                        new_page.insert_text(fitz.Point(x, y + img_h + 12), f"Foto {photo_idx + 1}: {caption}", fontsize=8, fontname=font_regular, color=(0.3, 0.3, 0.3))
+                    except Exception:
+                        new_page.draw_rect(fitz.Rect(x, y, x + img_w, y + img_h), color=(0.8, 0.2, 0.2), width=1)
+                        new_page.insert_text(fitz.Point(x + 10, y + img_h // 2), f"[Foto {photo_idx + 1} error]", fontsize=9, fontname=font_regular, color=(0.8, 0.2, 0.2))
+                    photo_idx += 1
+        output = io.BytesIO()
+        doc.save(output)
+        doc.close()
+        output.seek(0)
+        return output
+    except Exception as e:
+        return None
 
-    def data_table(self, headers, rows, col_widths):
-        """Buat tabel dengan header berwarna."""
-        if not rows:
-            return
-        # Header
-        self.set_font('Helvetica', 'B', 8)
-        self.set_fill_color(50, 60, 100)
-        self.set_text_color(255, 255, 255)
-        for i, h in enumerate(headers):
-            self.cell(col_widths[i], 7, h, border=1, align='C', fill=True)
-        self.ln()
-        # Rows
-        self.set_font('Helvetica', '', 8)
-        self.set_text_color(0, 0, 0)
-        for row in rows:
-            # Hitung tinggi baris dari konten terpanjang
-            max_lines = 1
-            for i, cell_val in enumerate(row):
-                lines = self.multi_cell(col_widths[i], 5, str(cell_val), dry_run=True, output="LINES")
-                max_lines = max(max_lines, len(lines))
-            row_h = max(6, max_lines * 5)
-            # Cek apakah perlu page break
-            if self.get_y() + row_h > 265:
-                self.add_page()
-                self.set_font('Helvetica', 'B', 8)
-                self.set_fill_color(50, 60, 100)
-                self.set_text_color(255, 255, 255)
-                for i, h in enumerate(headers):
-                    self.cell(col_widths[i], 7, h, border=1, align='C', fill=True)
-                self.ln()
-                self.set_font('Helvetica', '', 8)
-                self.set_text_color(0, 0, 0)
-            # Tulis cell dengan multi_cell
-            x_start = self.get_x()
-            y_start = self.get_y()
-            for i, cell_val in enumerate(row):
-                x = x_start + sum(col_widths[:i])
-                self.set_xy(x, y_start)
-                # Draw cell border
-                self.rect(x, y_start, col_widths[i], row_h)
-                self.set_xy(x + 1, y_start + 1)
-                self.multi_cell(col_widths[i] - 2, 5, str(cell_val))
-            self.set_xy(x_start, y_start + row_h)
-        self.ln(3)
+
+def _render_table(pdf, headers, rows, col_widths):
+    """Render tabel profesional dengan fpdf2 menggunakan cell()."""
+    if not rows:
+        return
+    row_h = 6.5
+
+    # ── Header ──
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_fill_color(20, 25, 66)  # Navy gelap
+    pdf.set_text_color(255, 255, 255)
+    for i, h in enumerate(headers):
+        align = 'C' if i == 0 else 'L'
+        pdf.cell(col_widths[i], row_h, f' {h[:30]}', border=1, align=align, fill=True)
+    pdf.ln()
+
+    # ── Data ──
+    pdf.set_font('Helvetica', '', 7.5)
+    pdf.set_text_color(30, 30, 30)
+    for ri, row in enumerate(rows):
+        # Cek page break
+        if pdf.get_y() + row_h > 260:
+            pdf.add_page()
+            # Header ulang
+            pdf.set_font('Helvetica', 'B', 8)
+            pdf.set_fill_color(20, 25, 66)
+            pdf.set_text_color(255, 255, 255)
+            for i, h in enumerate(headers):
+                align = 'C' if i == 0 else 'L'
+                pdf.cell(col_widths[i], row_h, f' {h[:30]}', border=1, align=align, fill=True)
+            pdf.ln()
+            pdf.set_font('Helvetica', '', 7.5)
+            pdf.set_text_color(30, 30, 30)
+
+        # Alternating row color
+        if ri % 2 == 0:
+            pdf.set_fill_color(248, 249, 252)
+        else:
+            pdf.set_fill_color(255, 255, 255)
+
+        # Max chars per column (Helvetica 7.5pt: ~0.38 chars/mm)
+        max_chars = [max(3, int(w * 0.38)) for w in col_widths]
+        for ci, val in enumerate(row):
+            align = 'C' if ci == 0 else 'L'
+            truncated = str(val)[:max_chars[ci]]
+            pdf.cell(col_widths[ci], row_h, f' {truncated}', border=1, align=align, fill=True)
+        pdf.ln()
+    pdf.ln(2)
 
 
 def build_report_pdf(data, photos):
-    """Generate PDF menggunakan fpdf2 dengan layout profesional.
-    Bekerja di semua platform (Windows, Linux, Mac)."""
-    pdf = ReportPDF()
+    """Hybrid PDF generation with 3-tier fallback:
+    1. PyMuPDF template-based (hasil identik template PDF)
+    2. win32com (Windows → hasil sempurna, identik template DOCX)
+    3. fpdf2 (cross-platform, layout profesional)
+    """
+    # Langkah 1: Coba PyMuPDF dari template PDF (paling akurat)
+    pymupdf_result = _try_pymupdf_template_pdf(data, photos)
+    win32_result = _try_win32com_pdf(data, photos)
+    if win32_result is not None:
+        return win32_result
+
+    # Langkah 2: Fallback ke fpdf2 (cross-platform)
+    class _ReportPDF(FPDF):
+        def footer(self):
+            self.set_y(-15)
+            self.set_font('Helvetica', 'I', 7.5)
+            self.set_text_color(130, 130, 130)
+            self.cell(0, 8, f'Halaman {self.page_no()}', align='C')
+    pdf = _ReportPDF()
     pdf.set_auto_page_break(auto=True, margin=20)
     pdf.add_page()
 
-    # ── 1. Informasi Umum ──
-    pdf.section_title('1. INFORMASI UMUM')
-    pdf.info_row('PIC Project', data['pic_project'] or '-')
-    pdf.info_row('Tanggal', format_tanggal(data['tanggal']))
+    # Header
+    pdf.set_font('Helvetica', 'B', 12)
+    pdf.set_text_color(20, 25, 66)
+    pdf.cell(0, 8, 'DAILY REPORT - NALE SYSTEM INTEGRATOR', new_x="LMARGIN", new_y="NEXT", align='C')
+    pdf.set_font('Helvetica', '', 9)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 5, 'Managed Service Dinas Kominfo Kab. Mojokerto', new_x="LMARGIN", new_y="NEXT", align='C')
+    # Garis pemisah
+    pdf.set_draw_color(245, 166, 35)
+    pdf.set_line_width(0.5)
+    y = pdf.get_y()
+    pdf.line(15, y+1, 195, y+1)
+    pdf.set_line_width(0.2)
+    pdf.set_draw_color(180, 180, 180)
+    pdf.ln(5)
 
+    def section_title(title):
+        pdf.ln(2)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.set_fill_color(245, 166, 35)
+        pdf.set_text_color(20, 25, 66)
+        pdf.cell(0, 6.5, f'  {title}', new_x="LMARGIN", new_y="NEXT", align='L', fill=True)
+        pdf.ln(2)
+
+    def info_row(label, value):
+        pdf.set_font('Helvetica', 'B', 8.5)
+        pdf.set_text_color(20, 25, 66)
+        pdf.cell(32, 5.5, f'{label}', new_x="END")
+        pdf.set_font('Helvetica', '', 8.5)
+        pdf.set_text_color(40, 40, 40)
+        pdf.cell(0, 5.5, f': {value}', new_x="LMARGIN", new_y="NEXT")
+
+    # ── 1. Informasi Umum ──
+    section_title('1. INFORMASI UMUM')
+    info_row('PIC Project', data['pic_project'] or '-')
+    info_row('Tanggal', format_tanggal(data['tanggal']))
     team_list = [t.strip() for t in re.split(r"[,;\n]", data['team_support']) if t.strip()]
     team_str = ', '.join(team_list) if team_list else '-'
-    pdf.info_row('Team Support', team_str)
-    pdf.info_row('Lokasi / Site', data['lokasi'] or '-')
-    pdf.ln(3)
+    info_row('Team Support', team_str)
+    info_row('Lokasi / Site', data['lokasi'] or '-')
+    pdf.ln(1)
 
     # ── 2. Kegiatan Harian ──
-    pdf.section_title('2. KEGIATAN HARIAN')
+    section_title('2. KEGIATAN HARIAN')
     if data['activities']:
-        pdf.data_table(
+        _render_table(pdf,
             ['No', 'Waktu', 'Uraian Kegiatan', 'Keterangan', 'Status'],
             [[i+1, a['waktu'], a['uraian'], a['keterangan'], a['status']] for i, a in enumerate(data['activities'])],
-            [10, 25, 75, 45, 25]
-        )
+            [10, 22, 78, 44, 20])
     else:
-        pdf.set_font('Helvetica', '', 9)
+        pdf.set_font('Helvetica', '', 8.5)
         pdf.cell(0, 6, 'Tidak ada kegiatan.', new_x="LMARGIN", new_y="NEXT")
 
     # ── 3. Kendala / Insiden ──
-    pdf.section_title('3. KENDALA / INSIDEN')
+    section_title('3. KENDALA / INSIDEN')
     if data['incidents']:
-        pdf.data_table(
+        _render_table(pdf,
             ['No', 'Masalah', 'Tindakan', 'Hasil'],
             [[i+1, inc['masalah'], inc['tindakan'], inc['hasil']] for i, inc in enumerate(data['incidents'])],
-            [10, 65, 60, 55]
-        )
+            [10, 65, 60, 55])
     else:
-        pdf.set_font('Helvetica', '', 9)
+        pdf.set_font('Helvetica', '', 8.5)
         pdf.cell(0, 6, 'Tidak ada kendala.', new_x="LMARGIN", new_y="NEXT")
 
     # ── 4. Follow Up ──
-    pdf.section_title('4. PEKERJAAN BELUM SELESAI / FOLLOW UP')
+    section_title('4. PEKERJAAN BELUM SELESAI / FOLLOW UP')
     if data['followups']:
-        pdf.data_table(
+        _render_table(pdf,
             ['No', 'Deskripsi', 'Alasan/Kendala', 'Target'],
             [[i+1, fu['deskripsi'], fu['alasan'], fu['target']] for i, fu in enumerate(data['followups'])],
-            [10, 65, 60, 55]
-        )
+            [10, 65, 60, 55])
     else:
-        pdf.set_font('Helvetica', '', 9)
+        pdf.set_font('Helvetica', '', 8.5)
         pdf.cell(0, 6, 'Tidak ada follow up.', new_x="LMARGIN", new_y="NEXT")
 
     # ── 5. Catatan Tambahan ──
-    pdf.section_title('5. CATATAN TAMBAHAN')
-    pdf.set_font('Helvetica', '', 9)
+    section_title('5. CATATAN TAMBAHAN')
+    pdf.set_font('Helvetica', '', 8.5)
+    pdf.set_text_color(40, 40, 40)
     pdf.multi_cell(0, 5, data['catatan'] if data['catatan'] else '-')
-    pdf.ln(3)
 
     # ── 6. Material ──
-    pdf.section_title('6. MATERIAL YANG DIGUNAKAN')
+    section_title('6. MATERIAL YANG DIGUNAKAN')
     if data['materials']:
-        pdf.data_table(
+        _render_table(pdf,
             ['No', 'Nama Material', 'Qty', 'Kondisi', 'Keterangan'],
             [[i+1, m['nama'], m['qty'], m['kondisi'], m['keterangan']] for i, m in enumerate(data['materials'])],
-            [10, 60, 15, 20, 45]
-        )
+            [10, 60, 15, 20, 45])
     else:
-        pdf.set_font('Helvetica', '', 9)
+        pdf.set_font('Helvetica', '', 8.5)
         pdf.cell(0, 6, 'Tidak ada material.', new_x="LMARGIN", new_y="NEXT")
 
     # ── 7. Lampiran Foto ──
     if photos:
         pdf.add_page()
-        pdf.section_title('7. LAMPIRAN FOTO KEGIATAN')
+        section_title('7. LAMPIRAN FOTO KEGIATAN')
 
         img_w = 80
-        img_h = 60
-        margin_x = 15
-        gap = 10
-        x_positions = [margin_x, margin_x + img_w + gap]
+        img_h = 58
+        x_left = 15
+        x_right = x_left + img_w + 8
         y_start = pdf.get_y()
 
+        photo_row = 0
         for idx, p in enumerate(photos):
             col = idx % 2
-            row = idx // 2
-            x = x_positions[col]
-            y = y_start + row * (img_h + 18)
+            x = x_left if col == 0 else x_right
+            y = y_start + photo_row * (img_h + 16)
 
-            # Cek apakah perlu halaman baru
             if y + img_h > 260:
                 pdf.add_page()
-                pdf.section_title('7. LAMPIRAN FOTO KEGIATAN (lanjutan)')
+                section_title('7. LAMPIRAN FOTO KEGIATAN (lanjutan)')
                 y_start = pdf.get_y()
-                row = 0
-                col = idx % 2
-                x = x_positions[col]
-                y = y_start + row * (img_h + 18)
+                photo_row = 0
+                y = y_start
+                x = x_left if col == 0 else x_right
 
-            # Simpan gambar ke temp file
             try:
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
                 tmp.write(p['bytes'])
                 tmp_path = tmp.name
                 tmp.close()
-
+                # Border foto
+                pdf.set_draw_color(180, 180, 180)
+                pdf.rect(x-0.3, y-0.3, img_w+0.6, img_h+0.6)
                 pdf.image(tmp_path, x=x, y=y, w=img_w, h=img_h)
-                pdf.set_xy(x, y + img_h)
+                pdf.set_xy(x, y + img_h + 1)
                 pdf.set_font('Helvetica', 'I', 7)
-                pdf.cell(img_w, 5, f"Foto {idx+1}: {p['caption'][:50]}", align='C')
+                pdf.set_text_color(100, 100, 100)
+                caption = p['caption'][:50] if p['caption'] else 'Foto Kegiatan'
+                pdf.cell(img_w, 5, f'Foto {idx+1}: {caption}', align='C')
                 os.unlink(tmp_path)
             except Exception:
-                pdf.set_xy(x, y)
+                pdf.set_draw_color(200, 50, 50)
+                pdf.rect(x, y, img_w, img_h)
+                pdf.set_xy(x, y + 2)
                 pdf.set_font('Helvetica', '', 8)
-                pdf.cell(img_w, img_h, f"[Foto {idx+1} gagal dimuat]", border=1, align='C')
+                pdf.set_text_color(200, 50, 50)
+                pdf.cell(img_w, img_h-4, f'[Foto {idx+1} error]', align='C')
 
-    # Output
+            # Increment row after second column
+            if col == 1:
+                photo_row += 1
+
     output = io.BytesIO()
     pdf.output(output)
     output.seek(0)
@@ -734,6 +946,8 @@ st.markdown("""
 if not TEMPLATE_PATH.exists():
     st.error(f"❌ File template tidak ditemukan: `{TEMPLATE_PATH}`")
     st.stop()
+if not TEMPLATE_PDF_PATH.exists():
+    st.warning(f"⚠️ File template PDF tidak ditemukan: `{TEMPLATE_PDF_PATH.name}`. PDF fallback akan menggunakan fpdf2 (tidak identik dengan template). Rekomendasi: letakkan template PDF di folder yang sama dengan app.py.")
 
 # Load data
 persist = load_persist()
