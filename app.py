@@ -15,6 +15,9 @@ from copy import deepcopy
 import io
 import json
 import re
+import os
+import tempfile
+from fpdf import FPDF
 
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
@@ -514,55 +517,205 @@ def build_report(data, photos):
     return output
 
 # ═══════════════════════════════════════════════════════════════
-# PDF GENERATION (konversi DOCX → PDF via Word agar format identik)
+# PDF GENERATION (menggunakan fpdf2 — murni Python, cross-platform)
 # ═══════════════════════════════════════════════════════════════
+
+class ReportPDF(FPDF):
+    """Kelas PDF khusus untuk laporan Daily Report dengan layout profesional."""
+
+    def header(self):
+        self.set_font('Helvetica', 'B', 11)
+        self.cell(0, 8, 'DAILY REPORT - NALE SYSTEM INTEGRATOR', new_x="LMARGIN", new_y="NEXT", align='C')
+        self.set_font('Helvetica', '', 9)
+        self.cell(0, 5, 'Managed Service Dinas Kominfo Kab. Mojokerto', new_x="LMARGIN", new_y="NEXT", align='C')
+        self.line(10, self.get_y()+1, 200, self.get_y()+1)
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Helvetica', 'I', 8)
+        self.cell(0, 10, f'Halaman {self.page_no()}', align='C')
+
+    def section_title(self, title):
+        self.set_font('Helvetica', 'B', 10)
+        self.set_fill_color(245, 166, 35)
+        self.cell(0, 7, f'  {title}', new_x="LMARGIN", new_y="NEXT", align='L', fill=True)
+        self.ln(3)
+
+    def info_row(self, label, value):
+        self.set_font('Helvetica', 'B', 9)
+        self.cell(35, 6, label, new_x="END")
+        self.set_font('Helvetica', '', 9)
+        self.cell(0, 6, f': {value}', new_x="LMARGIN", new_y="NEXT")
+
+    def data_table(self, headers, rows, col_widths):
+        """Buat tabel dengan header berwarna."""
+        if not rows:
+            return
+        # Header
+        self.set_font('Helvetica', 'B', 8)
+        self.set_fill_color(50, 60, 100)
+        self.set_text_color(255, 255, 255)
+        for i, h in enumerate(headers):
+            self.cell(col_widths[i], 7, h, border=1, align='C', fill=True)
+        self.ln()
+        # Rows
+        self.set_font('Helvetica', '', 8)
+        self.set_text_color(0, 0, 0)
+        for row in rows:
+            # Hitung tinggi baris dari konten terpanjang
+            max_lines = 1
+            for i, cell_val in enumerate(row):
+                lines = self.multi_cell(col_widths[i], 5, str(cell_val), dry_run=True, output="LINES")
+                max_lines = max(max_lines, len(lines))
+            row_h = max(6, max_lines * 5)
+            # Cek apakah perlu page break
+            if self.get_y() + row_h > 265:
+                self.add_page()
+                self.set_font('Helvetica', 'B', 8)
+                self.set_fill_color(50, 60, 100)
+                self.set_text_color(255, 255, 255)
+                for i, h in enumerate(headers):
+                    self.cell(col_widths[i], 7, h, border=1, align='C', fill=True)
+                self.ln()
+                self.set_font('Helvetica', '', 8)
+                self.set_text_color(0, 0, 0)
+            # Tulis cell dengan multi_cell
+            x_start = self.get_x()
+            y_start = self.get_y()
+            for i, cell_val in enumerate(row):
+                x = x_start + sum(col_widths[:i])
+                self.set_xy(x, y_start)
+                # Draw cell border
+                self.rect(x, y_start, col_widths[i], row_h)
+                self.set_xy(x + 1, y_start + 1)
+                self.multi_cell(col_widths[i] - 2, 5, str(cell_val))
+            self.set_xy(x_start, y_start + row_h)
+        self.ln(3)
+
+
 def build_report_pdf(data, photos):
-    """Generate DOCX dulu, lalu konversi ke PDF via Microsoft Word.
-    Hasilnya akan identik dengan template DOCX."""
-    import tempfile
-    import os
-    import pythoncom
+    """Generate PDF menggunakan fpdf2 dengan layout profesional.
+    Bekerja di semua platform (Windows, Linux, Mac)."""
+    pdf = ReportPDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
 
-    # Generate DOCX bytes dulu
-    docx_bytes = build_report(data, photos).getvalue()
+    # ── 1. Informasi Umum ──
+    pdf.section_title('1. INFORMASI UMUM')
+    pdf.info_row('PIC Project', data['pic_project'] or '-')
+    pdf.info_row('Tanggal', format_tanggal(data['tanggal']))
 
-    # Simpan ke temp file
-    tmp_dir = tempfile.mkdtemp()
-    docx_path = os.path.join(tmp_dir, "report_temp.docx")
-    pdf_path = os.path.join(tmp_dir, "report_temp.pdf")
+    team_list = [t.strip() for t in re.split(r"[,;\n]", data['team_support']) if t.strip()]
+    team_str = ', '.join(team_list) if team_list else '-'
+    pdf.info_row('Team Support', team_str)
+    pdf.info_row('Lokasi / Site', data['lokasi'] or '-')
+    pdf.ln(3)
 
-    try:
-        with open(docx_path, "wb") as f:
-            f.write(docx_bytes)
+    # ── 2. Kegiatan Harian ──
+    pdf.section_title('2. KEGIATAN HARIAN')
+    if data['activities']:
+        pdf.data_table(
+            ['No', 'Waktu', 'Uraian Kegiatan', 'Keterangan', 'Status'],
+            [[i+1, a['waktu'], a['uraian'], a['keterangan'], a['status']] for i, a in enumerate(data['activities'])],
+            [10, 25, 75, 45, 25]
+        )
+    else:
+        pdf.set_font('Helvetica', '', 9)
+        pdf.cell(0, 6, 'Tidak ada kegiatan.', new_x="LMARGIN", new_y="NEXT")
 
-        # Konversi via Word
-        pythoncom.CoInitialize()
-        try:
-            from win32com.client import Dispatch
-            word = Dispatch("Word.Application")
-            word.Visible = False
-            word.DisplayAlerts = False
+    # ── 3. Kendala / Insiden ──
+    pdf.section_title('3. KENDALA / INSIDEN')
+    if data['incidents']:
+        pdf.data_table(
+            ['No', 'Masalah', 'Tindakan', 'Hasil'],
+            [[i+1, inc['masalah'], inc['tindakan'], inc['hasil']] for i, inc in enumerate(data['incidents'])],
+            [10, 65, 60, 55]
+        )
+    else:
+        pdf.set_font('Helvetica', '', 9)
+        pdf.cell(0, 6, 'Tidak ada kendala.', new_x="LMARGIN", new_y="NEXT")
 
-            doc = word.Documents.Open(os.path.abspath(docx_path))
-            doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17)  # 17 = wdFormatPDF
-            doc.Close()
-            word.Quit()
-        finally:
-            pythoncom.CoUninitialize()
+    # ── 4. Follow Up ──
+    pdf.section_title('4. PEKERJAAN BELUM SELESAI / FOLLOW UP')
+    if data['followups']:
+        pdf.data_table(
+            ['No', 'Deskripsi', 'Alasan/Kendala', 'Target'],
+            [[i+1, fu['deskripsi'], fu['alasan'], fu['target']] for i, fu in enumerate(data['followups'])],
+            [10, 65, 60, 55]
+        )
+    else:
+        pdf.set_font('Helvetica', '', 9)
+        pdf.cell(0, 6, 'Tidak ada follow up.', new_x="LMARGIN", new_y="NEXT")
 
-        with open(pdf_path, "rb") as f:
-            pdf_bytes = f.read()
+    # ── 5. Catatan Tambahan ──
+    pdf.section_title('5. CATATAN TAMBAHAN')
+    pdf.set_font('Helvetica', '', 9)
+    pdf.multi_cell(0, 5, data['catatan'] if data['catatan'] else '-')
+    pdf.ln(3)
 
-        return io.BytesIO(pdf_bytes)
+    # ── 6. Material ──
+    pdf.section_title('6. MATERIAL YANG DIGUNAKAN')
+    if data['materials']:
+        pdf.data_table(
+            ['No', 'Nama Material', 'Qty', 'Kondisi', 'Keterangan'],
+            [[i+1, m['nama'], m['qty'], m['kondisi'], m['keterangan']] for i, m in enumerate(data['materials'])],
+            [10, 60, 15, 20, 45]
+        )
+    else:
+        pdf.set_font('Helvetica', '', 9)
+        pdf.cell(0, 6, 'Tidak ada material.', new_x="LMARGIN", new_y="NEXT")
 
-    finally:
-        # Bersihkan temp files
-        try:
-            os.remove(docx_path)
-            os.remove(pdf_path)
-            os.rmdir(tmp_dir)
-        except Exception:
-            pass
+    # ── 7. Lampiran Foto ──
+    if photos:
+        pdf.add_page()
+        pdf.section_title('7. LAMPIRAN FOTO KEGIATAN')
+
+        img_w = 80
+        img_h = 60
+        margin_x = 15
+        gap = 10
+        x_positions = [margin_x, margin_x + img_w + gap]
+        y_start = pdf.get_y()
+
+        for idx, p in enumerate(photos):
+            col = idx % 2
+            row = idx // 2
+            x = x_positions[col]
+            y = y_start + row * (img_h + 18)
+
+            # Cek apakah perlu halaman baru
+            if y + img_h > 260:
+                pdf.add_page()
+                pdf.section_title('7. LAMPIRAN FOTO KEGIATAN (lanjutan)')
+                y_start = pdf.get_y()
+                row = 0
+                col = idx % 2
+                x = x_positions[col]
+                y = y_start + row * (img_h + 18)
+
+            # Simpan gambar ke temp file
+            try:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+                tmp.write(p['bytes'])
+                tmp_path = tmp.name
+                tmp.close()
+
+                pdf.image(tmp_path, x=x, y=y, w=img_w, h=img_h)
+                pdf.set_xy(x, y + img_h)
+                pdf.set_font('Helvetica', 'I', 7)
+                pdf.cell(img_w, 5, f"Foto {idx+1}: {p['caption'][:50]}", align='C')
+                os.unlink(tmp_path)
+            except Exception:
+                pdf.set_xy(x, y)
+                pdf.set_font('Helvetica', '', 8)
+                pdf.cell(img_w, img_h, f"[Foto {idx+1} gagal dimuat]", border=1, align='C')
+
+    # Output
+    output = io.BytesIO()
+    pdf.output(output)
+    output.seek(0)
+    return output
 
 # ═══════════════════════════════════════════════════════════════
 # UI
@@ -705,11 +858,11 @@ with tab_info:
     st.markdown("---")
     col_save1, col_save2 = st.columns(2)
     with col_save1:
-        if st.button("💾 Simpan Draft (Semua Data)", use_container_width=True):
+        if st.button("💾 Simpan Draft (Semua Data)", width='stretch'):
             auto_save_full_data()
             st.success("Data disimpan ke file. Tidak akan hilang meskipun refresh.")
     with col_save2:
-        if st.button("🔄 Muat Ulang Draft", use_container_width=True):
+        if st.button("🔄 Muat Ulang Draft", width='stretch'):
             st.session_state.full_data = load_full_data()
             st.rerun()
 
@@ -751,7 +904,7 @@ with tab_photos:
         for i, photo in enumerate(st.session_state.photos):
             cols = st.columns([1.5, 3, 0.5, 0.5, 0.5, 0.5, 0.7])
             with cols[0]:
-                st.image(photo["bytes"], use_container_width=True)
+                st.image(photo["bytes"], width='stretch')
             with cols[1]:
                 new_caption = st.text_area(f"Caption {i+1}", value=photo["caption"], placeholder="Deskripsi foto kegiatan...", key=f"photo_cap_{i}", height=100, label_visibility="collapsed")
                 st.session_state.photos[i]["caption"] = new_caption
@@ -792,7 +945,7 @@ col_format, col_gen, col_dummy = st.columns([1, 2, 1])
 with col_format:
     format_option = st.radio("Pilih format:", ["Microsoft Word (.docx)", "PDF (.pdf)"], horizontal=True, key="format_radio")
 with col_gen:
-    if st.button("📄 Generate & Download", type="primary", use_container_width=True):
+    if st.button("📄 Generate & Download", type="primary", width='stretch'):
         if not pic_project.strip():
             st.error("⚠️ PIC Project harus diisi.")
         elif not any(a["uraian"].strip() for a in full_data.get("activities", [])):
@@ -817,9 +970,9 @@ with col_gen:
                         ext = ".docx"
                         mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     else:
-                        with st.status("⏳ Mengkonversi ke PDF via Microsoft Word...", expanded=True) as status:
-                            st.write("1/2 Membuat DOCX...")
-                            st.write("2/2 Konversi ke PDF via Word...")
+                        with st.status("⏳ Membuat PDF...", expanded=True) as status:
+                            st.write("Membuat laporan PDF...")
+                            st.write("Memproses data tabel & foto...")
                             output = build_report_pdf(data_report, st.session_state.photos)
                             status.update(label="✅ PDF selesai!", state="complete")
                         ext = ".pdf"
@@ -841,5 +994,5 @@ if "last_output" in st.session_state:
             data=st.session_state.last_output,
             file_name=st.session_state.last_filename,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document" if ".docx" in st.session_state.last_filename else "application/pdf",
-            use_container_width=True,
+            width='stretch',
         )
